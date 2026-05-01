@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "unsloth-mcp-search"
+version = "0.1.0"
+description = "MCP server exposing Unsloth Studio's web_search tool (DuckDuckGo + URL fetch with HTML→Markdown)"
+readme = "README.md"
+license = "AGPL-3.0-only"
+requires-python = ">=3.10"
+authors = [{ name = "Hasan" }]
+dependencies = [
+  "mcp[cli]>=1.0.0",
+  "ddgs>=9.0.0",
+]
+
+[project.scripts]
+unsloth-mcp-search = "unsloth_mcp_search.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/unsloth_mcp_search"]
