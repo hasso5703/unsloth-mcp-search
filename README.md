@@ -8,7 +8,20 @@ Single tool, two modes:
 
 Code is vendored from [unslothai/unsloth `studio/backend/core/inference/`](https://github.com/unslothai/unsloth/blob/main/studio/backend/core/inference/tools.py) — the web bits of `tools.py` (`web_search` / page fetch) plus `_html_to_md.py` verbatim. Same anti-DNS-rebinding IP pinning, non-global/SSRF address rejection, random User-Agent rotation, redirect handling, and minimal HTML→MD converter (no `html2text` dependency).
 
-Synced as of upstream commit `a895d1c` (2026-06-01). `_html_to_md.py` is byte-identical to upstream; the web code tracks `tools.py` with only the standalone-glue changes (public function names, no sandbox/exec machinery).
+Synced as of upstream commit `5b24b8a` (2026-08-03). `_html_to_md.py` is byte-identical to upstream; the web code tracks `tools.py` with only the standalone-glue changes (public function names, no sandbox/exec machinery).
+
+Carried over from upstream in this sync:
+
+- **`UnicodeError` on resolve** — IDNA rejects a bad hostname with `UnicodeError`, not `OSError`, which escaped as an unhandled exception.
+- **Bare hostnames** — `example.com` / `example.com:8443` are fetched as `https://`, instead of being refused.
+- **Binary rejection** — known-binary MIME types and magic signatures return a placeholder rather than being decoded into replacement chars.
+- **PDF extraction** — page-delimited text, capped at 50 pages. Upstream uses Studio's RAG parser (pymupdf); this server uses `pypdf` (pure Python, text-only).
+- **Main-content extraction** — `html_to_markdown(..., main_content=True)`: `<article>`/`<main>` scoping, boilerplate stripping (skip-links, cookie/session banners), `<header>` dropped, `<aside>` kept for docs admonitions, plus the `_VOID_TAGS` fix so void elements no longer corrupt hidden-subtree bounding.
+- **GitHub repo roots** — routed to the README API, so the README is read instead of the page's UI chrome.
+- **One fetch deadline** — a single wall-clock budget covers the README attempt, the HTML fallback and every redirect hop, so a slow step cannot hand its fallback a fresh full timeout.
+- **Enterprise proxies** — set `UNSLOTH_MCP_DISABLE_DNS_PINNING=1` to send the hostname (not the pinned IP) when a proxy needs it for CONNECT/TLS interception. This weakens the DNS-rebinding defense; leave it unset otherwise.
+
+Deliberately not carried over (Studio-only): `website_policy` allow/block domain lists and the `cancel_event` cancellation plumbing.
 
 ## Install (macOS)
 
