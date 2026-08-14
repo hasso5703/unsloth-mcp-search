@@ -11,7 +11,8 @@ license = "AGPL-3.0-only"
 requires-python = ">=3.10"
 authors = [{ name = "Hasan" }]
 dependencies = [
-  # mcp 2.x removed `mcp.server.fastmcp`, which server.py imports.
+  # mcp 2.x removed `mcp.server.fastmcp` (renamed MCPServer), which server.py
+  # imports; the 1.x branch is in maintenance and still gets security fixes.
   "mcp[cli]>=1.0.0,<2",
   "ddgs>=9.0.0",
   # PDF text extraction. Upstream uses Studio's RAG parser (pymupdf, ~50 MB);

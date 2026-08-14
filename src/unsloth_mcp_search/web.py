@@ -40,7 +40,19 @@ _MAX_WEB_PDF_PAGES = 50
 
 # Set to "1" behind an enterprise proxy that needs the hostname in CONNECT for
 # policy and TLS interception; disables DNS pinning (weakens rebinding defense).
+# Only honored when urllib actually routes the request through a configured
+# proxy; a direct fetch stays pinned to the validated IP either way.
 _DISABLE_DNS_PINNING_ENV = "UNSLOTH_MCP_DISABLE_DNS_PINNING"
+
+# A search that ran but produced nothing usable. Not a tool error. Kept as the
+# upstream two-entry tuple; the second entry is only produced by Studio's
+# website-policy filtering, which this server does not carry.
+EMPTY_SEARCH_RESULTS = (
+    "No results found.",
+    "No results found within the website access limits.",
+)
+# ddgs signals an empty sweep by raising rather than returning [].
+_DDGS_EMPTY_SWEEP = "No results found"
 
 # Control/undecodable chars, excluding text whitespace and ESC (for ANSI logs).
 # Binary when they exceed 12.5%, after allowing 16 minor encoding glitches.
@@ -370,6 +382,32 @@ def _check_url_access(url: str) -> tuple[bool, str, str]:
     return True, "", hostname
 
 
+def _explicit_proxy_applies(scheme: str, host: str) -> bool:
+    """Whether urllib routes a *scheme* request for *host* through a proxy.
+
+    Only a proxied fetch may keep the hostname in the request URL: the proxy
+    resolves it, so this host never looks it up again. A direct one would,
+    which is the DNS-rebinding window, so it stays pinned to the validated IP.
+
+    *host* must be the ``host[:port]`` form ``Request.host`` carries, since
+    that is what ``ProxyHandler`` passes to ``proxy_bypass``; probing the bare
+    hostname instead would disagree with it on a port-qualified NO_PROXY entry.
+    """
+    from urllib.request import getproxies, proxy_bypass
+
+    # ProxyHandler lowercases every mapping key, and the Windows registry can
+    # hand back "HTTPS=...", so normalize before testing or a proxy-only host
+    # goes direct.
+    if scheme not in {key.lower() for key in getproxies()}:
+        return False
+    try:
+        return not proxy_bypass(host)
+    except (OSError, ValueError):
+        # proxy_bypass reads system config on macOS/Windows; failure falls
+        # back to pinning.
+        return False
+
+
 def _validate_and_resolve_host(hostname: str, port: int) -> tuple[bool, str, str]:
     """Resolve *hostname*, reject non-public IPs, return a pinned IP string.
 
@@ -558,9 +596,14 @@ def _fetch_url_raw(
             validated_netloc = f"[{current_host}]" if ":" in current_host else current_host
             if cp.port:
                 validated_netloc = f"{validated_netloc}:{cp.port}"
-            if os.environ.get(_DISABLE_DNS_PINNING_ENV) == "1":
-                # Enterprise proxies need the hostname in CONNECT for policy and
-                # TLS interception.
+            # Decide routing once, on the netloc urllib tests: a pinned request
+            # carries an IP, which no NO_PROXY entry matches, so the opener
+            # below has to carry the decision rather than re-derive it.
+            proxied = _explicit_proxy_applies(cp.scheme, validated_netloc)
+            if os.environ.get(_DISABLE_DNS_PINNING_ENV) == "1" and proxied:
+                # Enterprise proxies need the hostname in CONNECT for policy
+                # and TLS interception, and they resolve it, so nothing rebinds
+                # behind us.
                 request_url = urlunparse(cp._replace(netloc=validated_netloc))
             else:
                 # Pin to the validated IP to prevent DNS rebinding.
@@ -568,10 +611,12 @@ def _fetch_url_raw(
                 ip_netloc = f"{ip_str}:{cp.port}" if cp.port else ip_str
                 request_url = urlunparse(cp._replace(netloc=ip_netloc))
 
-            opener = urllib.request.build_opener(
-                _NoRedirect,
-                _SNIHTTPSHandler(current_host),
-            )
+            handlers = [_NoRedirect, _SNIHTTPSHandler(current_host)]
+            if not proxied:
+                # An empty ProxyHandler is the documented way to opt a request
+                # out.
+                handlers.append(urllib.request.ProxyHandler({}))
+            opener = urllib.request.build_opener(*handlers)
 
             headers = {
                 "User-Agent": ua,
@@ -815,15 +860,47 @@ def fetch_page_text(url: str, max_chars: int = _MAX_PAGE_CHARS, timeout: int = 3
     return _truncate_page_text(html_to_markdown(body, main_content=True), max_chars)
 
 
+def _search_failure_message(exc: BaseException, timeout: int) -> str:
+    """Turn a ddgs exception into text the model can act on.
+
+    ddgs raises for an empty sweep as well as for refusals, so an unclassified
+    ``Search failed: {exc}`` reports "nothing matched" and "every engine
+    throttled us" the same way. Matched by class name because ddgs is imported
+    lazily.
+
+    The RatelimitException arm is forward-looking: ddgs 9.14.4 defines the
+    class but raises it nowhere, and no engine inspects the status code, so a
+    throttled sweep parses to zero items and arrives here as the empty-sweep
+    DDGSException instead.
+    """
+    name = type(exc).__name__
+    if name == "RatelimitException":
+        return (
+            "Search failed: the search engines are rate limiting this machine. "
+            "Wait a minute before searching again, or read a known page "
+            'directly with {"url": "<URL>"}.'
+        )
+    if name == "TimeoutException":
+        budget = f" within {timeout}s" if timeout else ""
+        return f"Search failed: the search engines did not respond{budget}."
+    # Only the base exception, so a subclass that happens to quote the phrase
+    # stays an error.
+    if name == "DDGSException" and _DDGS_EMPTY_SWEEP in str(exc):
+        return EMPTY_SEARCH_RESULTS[0]
+    return f"Search failed: {exc}"
+
+
 def web_search(
     query: str = "",
     max_results: int = 5,
     timeout: int = 30,
     url: str | None = None,
 ) -> str:
-    """Search the web (DuckDuckGo via `ddgs`) or fetch a URL.
+    """Search the web (via `ddgs`) or fetch a URL.
 
-    If `url` is provided, fetches that page directly instead of searching.
+    ddgs fans the query out across its search engines, so a single engine
+    refusing is already covered. If `url` is provided, fetches that page
+    directly instead of searching.
     """
     if url and url.strip():
         fetch_timeout = 60 if timeout is None else min(timeout, 60)
@@ -836,7 +913,7 @@ def web_search(
 
         results = DDGS(timeout=timeout).text(query, max_results=max_results)
         if not results:
-            return "No results found."
+            return EMPTY_SEARCH_RESULTS[0]
         parts = []
         for r in results:
             parts.append(
@@ -852,4 +929,4 @@ def web_search(
         )
         return text
     except Exception as e:
-        return f"Search failed: {e}"
+        return _search_failure_message(e, timeout)

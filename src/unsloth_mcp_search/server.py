@@ -35,7 +35,7 @@ def web_search(query: str = "", url: str = "") -> str:
 
 
 def main() -> None:
-    """Stdio entry point — run with `unsloth-mcp-search` after install."""
+    """Stdio entry point; run with `unsloth-mcp-search` after install."""
     mcp.run()
 
 
