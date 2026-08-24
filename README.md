@@ -75,6 +75,50 @@ Or, if you prefer running ephemerally without install:
 claude mcp add unsloth-search -- uvx --from /path/to/unsloth-mcp-search unsloth-mcp-search
 ```
 
+## Register in opencode
+
+opencode reads MCP servers from `~/.config/opencode/opencode.json`. Add a local (stdio) server under `mcp`:
+
+```json
+{
+  "mcp": {
+    "web_search": {
+      "type": "local",
+      "command": ["uvx", "--from", "git+https://github.com/hasso5703/unsloth-mcp-search", "unsloth-mcp-search"],
+      "enabled": true
+    }
+  }
+}
+```
+
+Reload with `/mcp` (or start a new session) after editing; the model then calls `web_search` on its own.
+
+## Run from an editable checkout (development)
+
+`uvx` caches its build per package **version**, so an edit under `src/` is not picked up until `version` in `pyproject.toml` changes. During active development, point the client at an editable virtualenv instead, which follows `src/` directly with no cache and no version bump:
+
+```bash
+uv venv
+uv pip install -e .
+# entry point is now .venv/bin/unsloth-mcp-search
+```
+
+Use that binary as the MCP command. For opencode, set `mcp.web_search.command` to it:
+
+```json
+{
+  "mcp": {
+    "web_search": {
+      "type": "local",
+      "command": ["/path/to/unsloth-mcp-search/.venv/bin/unsloth-mcp-search"],
+      "enabled": true
+    }
+  }
+}
+```
+
+For Claude Code the same binary works: `claude mcp add unsloth-search -- /path/to/unsloth-mcp-search/.venv/bin/unsloth-mcp-search`. Edits take effect on the next `/mcp` reload.
+
 ## Verify
 
 ```bash
