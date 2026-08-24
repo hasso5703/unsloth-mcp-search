@@ -28,6 +28,8 @@ import threading
 import time
 import urllib.request
 
+from .governor import EMPTY, ERROR, OK, THROTTLED, governor
+
 logger = logging.getLogger(__name__)
 
 _MAX_PAGE_CHARS = 16000  # cap fetched page text (after HTML-to-MD conversion)
@@ -37,6 +39,11 @@ _MAX_FETCH_BYTES = 512 * 1024
 # PDF cross-reference data lives at EOF, so extraction needs the whole body.
 _MAX_PDF_FETCH_BYTES = 10 * 1024 * 1024
 _MAX_WEB_PDF_PAGES = 50
+
+# Only cache substantial page text. Fetch errors and bot-blocked or JS-only
+# pages come back short, and caching a transient failure would keep serving it
+# for the whole TTL, so a length floor keeps them out of the cache.
+_FETCH_CACHE_MIN_CHARS = 400
 
 # Set to "1" behind an enterprise proxy that needs the hostname in CONNECT for
 # policy and TLS interception; disables DNS pinning (weakens rebinding defense).
@@ -890,6 +897,52 @@ def _search_failure_message(exc: BaseException, timeout: int) -> str:
     return f"Search failed: {exc}"
 
 
+def _is_fetch_cacheable(text: str) -> bool:
+    """Whether fetched page text is worth caching. Keeps short error and
+    bot-blocked responses out so a transient failure is not served for the
+    whole TTL."""
+    return len(text) >= _FETCH_CACHE_MIN_CHARS
+
+
+def _raw_search(query: str, max_results: int, timeout: int) -> tuple[str, str]:
+    """Run one ddgs sweep and classify the outcome for the governor.
+
+    Returns `(status, text)`: OK with formatted snippets; EMPTY when the sweep
+    produced nothing (ddgs also surfaces a rate-limited sweep this way);
+    THROTTLED when ddgs reports a timeout or rate limit; ERROR otherwise. The
+    text is exactly what the caller should receive.
+    """
+    try:
+        from ddgs import DDGS
+
+        results = DDGS(timeout=timeout).text(query, max_results=max_results)
+    except Exception as e:  # noqa: BLE001 - returned as tool text, never raised
+        name = type(e).__name__
+        status = THROTTLED if name in ("RatelimitException", "TimeoutException") else ERROR
+        return status, _search_failure_message(e, timeout)
+
+    if not results:
+        return EMPTY, EMPTY_SEARCH_RESULTS[0]
+    parts = []
+    for r in results:
+        # Collapse whitespace in title and snippet (as upstream does) so a
+        # multi-line value cannot break the Title/URL/Snippet framing.
+        title = " ".join(str(r.get("title") or "").split())
+        snippet = " ".join(str(r.get("body") or "").split())
+        parts.append(
+            f"Title: {title}\n"
+            f"URL: {r.get('href', '')}\n"
+            f"Snippet: {snippet}"
+        )
+    text = "\n\n---\n\n".join(parts)
+    text += (
+        "\n\n---\n\nIMPORTANT: These are only short snippets. "
+        "To get the full page content, call web_search with "
+        'the url parameter (e.g. {"url": "<URL>"}).'
+    )
+    return OK, text
+
+
 def web_search(
     query: str = "",
     max_results: int = 5,
@@ -898,35 +951,30 @@ def web_search(
 ) -> str:
     """Search the web (via `ddgs`) or fetch a URL.
 
+    Search calls run through an adaptive throttle, a short TTL cache, and a
+    hard time budget (see `governor.py`) so a burst never trips the search
+    engines' bot limits or the MCP client's request timeout. URL fetches are
+    cached but otherwise pass straight through, since they already carry their
+    own per-request deadline.
+
     ddgs fans the query out across its search engines, so a single engine
     refusing is already covered. If `url` is provided, fetches that page
     directly instead of searching.
     """
     if url and url.strip():
+        target = url.strip()
+        cached = governor.cache_get(("url", target))
+        if cached is not None:
+            return cached
         fetch_timeout = 60 if timeout is None else min(timeout, 60)
-        return fetch_page_text(url.strip(), timeout=fetch_timeout)
+        text = fetch_page_text(target, timeout=fetch_timeout)
+        if _is_fetch_cacheable(text):
+            governor.cache_put(("url", target), text)
+        return text
 
     if not query or not query.strip():
         return "No query provided."
-    try:
-        from ddgs import DDGS
-
-        results = DDGS(timeout=timeout).text(query, max_results=max_results)
-        if not results:
-            return EMPTY_SEARCH_RESULTS[0]
-        parts = []
-        for r in results:
-            parts.append(
-                f"Title: {r.get('title', '')}\n"
-                f"URL: {r.get('href', '')}\n"
-                f"Snippet: {r.get('body', '')}"
-            )
-        text = "\n\n---\n\n".join(parts)
-        text += (
-            "\n\n---\n\nIMPORTANT: These are only short snippets. "
-            "To get the full page content, call web_search with "
-            'the url parameter (e.g. {"url": "<URL>"}).'
-        )
-        return text
-    except Exception as e:
-        return _search_failure_message(e, timeout)
+    cache_key = ("query", query.strip(), max_results)
+    return governor.run_search(
+        lambda: _raw_search(query, max_results, timeout), cache_key
+    )

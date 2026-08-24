@@ -8,7 +8,7 @@ Single tool, two modes:
 
 Code is vendored from [unslothai/unsloth `studio/backend/core/inference/`](https://github.com/unslothai/unsloth/blob/main/studio/backend/core/inference/tools.py): the web bits of `tools.py` (`web_search` / page fetch) plus `_html_to_md.py` verbatim. Same anti-DNS-rebinding IP pinning, non-global/SSRF address rejection, random User-Agent rotation, redirect handling, and minimal HTML→MD converter (no `html2text` dependency).
 
-Synced as of upstream commit `a8be2a8` (2026-08-14). `_html_to_md.py` is byte-identical to upstream; the web code tracks `tools.py` with only the standalone-glue changes (public function names, no sandbox/exec machinery).
+Synced as of upstream commit `a8be2a8` (2026-08-14). `_html_to_md.py` is byte-identical to upstream; the web code tracks `tools.py` with only the standalone-glue changes (public function names, no sandbox/exec machinery). Checked against upstream `main` through `f2fa54f` (2026-08-24): nothing to re-port, the only web-path changes since were Studio-frontend features (model-sized page budgets, inline image search) that are out of scope here.
 
 Carried over from upstream in this sync:
 
@@ -23,6 +23,30 @@ Carried over from upstream in this sync:
 - **Classified search failures**: ddgs raising on an empty sweep now reads `No results found.` instead of an error; rate limiting and engine timeouts return actionable text (wait a minute, or fetch a known page directly with `{"url": "<URL>"}`).
 
 Deliberately not carried over (Studio-only): `website_policy` allow/block domain lists and the `cancel_event` cancellation plumbing.
+
+## Local hardening (not from upstream): throttle, cache, budget
+
+A burst of agent searches makes the search engines rate limit this machine (slow or empty sweeps). `ddgs` then walks several slow engines within one call and the total runs past the MCP client's request timeout, which the client reports as an opaque `-32001 Request timed out`. `governor.py` sits in front of the `ddgs` call to prevent that:
+
+- **Adaptive throttle** (additive-increase / multiplicative-decrease): near-zero spacing while sweeps succeed, growing automatically on each throttle signal, relaxing again as calls recover.
+- **Hard per-call budget**: a search always returns well under the client timeout, with an actionable message instead of `-32001`.
+- **Admission control**: past a concurrency cap, extra searches are refused fast with a busy message rather than queued into the timeout.
+- **Short TTL cache**: repeated queries and refetched URLs return instantly. Only substantial page text is cached, so a transient error or bot-blocked page is not served for the whole TTL.
+
+URL fetches pass straight through (they already carry their own deadline) but their result is cached. All of this is standalone glue in `governor.py`; `web.py` stays a near-verbatim mirror of upstream.
+
+Tunable via environment (defaults shown):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `UNSLOTH_MCP_SEARCH_BUDGET_S` | `18` | Hard ceiling per search. Keep under the client's MCP request timeout. |
+| `UNSLOTH_MCP_SEARCH_MIN_INTERVAL_S` | `0.3` | Delay floor between search starts when healthy. |
+| `UNSLOTH_MCP_SEARCH_PENALTY_STEP_S` | `1.5` | Extra spacing added on each throttle signal. |
+| `UNSLOTH_MCP_SEARCH_PENALTY_CAP_S` | `6` | Cap on that spacing. `cap + budget` must stay under the client timeout. |
+| `UNSLOTH_MCP_SEARCH_PENALTY_DECAY` | `0.5` | Fraction of the penalty kept per clean success. |
+| `UNSLOTH_MCP_SEARCH_MAX_INFLIGHT` | `4` | Concurrent searches past which new ones are shed. |
+| `UNSLOTH_MCP_SEARCH_CACHE_TTL_S` | `600` | Result cache lifetime (`0` disables). |
+| `UNSLOTH_MCP_SEARCH_CACHE_MAX_ENTRIES` | `512` | Cache size cap. |
 
 ## Install (macOS)
 

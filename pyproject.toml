@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "unsloth-mcp-search"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server exposing Unsloth Studio's web_search tool (DuckDuckGo + URL fetch with HTML→Markdown)"
 readme = "README.md"
 license = "AGPL-3.0-only"
